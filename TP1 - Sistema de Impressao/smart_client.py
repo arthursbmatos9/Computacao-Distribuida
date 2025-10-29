@@ -28,6 +28,11 @@ class SmartClient(printing_pb2_grpc.MutualExclusionServiceServicer):
         self.reply_lock = threading.Lock()
         self.server = None
         
+        self.print_separator = "="*50  # Adicionar separador visual
+    
+        self.max_retries = 3  # Número máximo de tentativas
+        self.retry_delay = 2  # Delay base entre tentativas (segundos)
+
     def increment_clock(self):
         with self.clock_lock:
             self.lamport_clock += 1
@@ -41,50 +46,91 @@ class SmartClient(printing_pb2_grpc.MutualExclusionServiceServicer):
     def RequestAccess(self, request, context):
         current_clock = self.update_clock(request.lamport_timestamp)
         
-        print(f"[REQUEST] Cliente {request.client_id} (TS: {request.lamport_timestamp})")
+        print(f"\n{self.print_separator}")
+        print(f"↓ REQUISIÇÃO RECEBIDA [TS: {request.lamport_timestamp}]")
+        print(f"  • De: Cliente {request.client_id}")
+        print(f"  • Estado local: {'OCUPADO' if (self.requesting_cs or self.in_cs) else 'LIVRE'}")
         
         with self.cs_lock:
-            if self.requesting_cs:
+            if self.requesting_cs or self.in_cs:
                 our_priority = (self.request_timestamp, self.client_id)
                 their_priority = (request.lamport_timestamp, request.client_id)
                 
+                # Se timestamps iguais, menor ID tem prioridade
+                if request.lamport_timestamp == self.request_timestamp:
+                    if self.client_id > request.client_id:
+                        their_priority = (request.lamport_timestamp - 1, request.client_id)
+                    else:
+                        our_priority = (self.request_timestamp - 1, self.client_id)
+                
                 if our_priority < their_priority:
                     self.deferred_replies.append(request.client_id)
-                    print(f"Adiando resposta para Cliente {request.client_id}")
+                    print(f"  ⏳ Adiando resposta - nossa prioridade é maior")
+                    print(f"     (TS:{self.request_timestamp} < TS:{request.lamport_timestamp})")
+                    print(f"{self.print_separator}")
                     return printing_pb2.AccessResponse(
                         access_granted=False,
                         lamport_timestamp=current_clock
                     )
-            
-            print(f"Concedendo acesso para Cliente {request.client_id}")
-            return printing_pb2.AccessResponse(
-                access_granted=True,
-                lamport_timestamp=current_clock
-            )
+                else:
+                    print(f"  ⌛ Nossa prioridade é menor - concedendo acesso")
+                    print(f"     (TS:{self.request_timestamp} > TS:{request.lamport_timestamp})")
+        
+        print(f"  ✓ Acesso concedido")
+        print(f"{self.print_separator}")
+        return printing_pb2.AccessResponse(
+            access_granted=True,
+            lamport_timestamp=current_clock
+        )
     
     def request_critical_section(self):
-        self.request_number += 1
-        current_ts = self.increment_clock()
-        
-        with self.cs_lock:
-            self.requesting_cs = True
-            self.request_timestamp = current_ts
-            self.replies_received = 0
-        
-        print(f"\nSolicitando secao critica (TS: {current_ts})")
-        self.refresh_active_peers()
+        retries = 0
+        while retries < self.max_retries:
+            self.request_number += 1
+            current_ts = self.increment_clock()
+            
+            print(f"\n{self.print_separator}")
+            print(f"→ SOLICITANDO SEÇÃO CRÍTICA")
+            print(f"  • Timestamp: {current_ts}")
+            print(f"  • Requisição #{self.request_number}")
+            if retries > 0:
+                print(f"  • Tentativa {retries + 1}/{self.max_retries}")
+            
+            with self.cs_lock:
+                self.requesting_cs = True
+                self.request_timestamp = current_ts
+                self.replies_received = 0
+            
+            self.refresh_active_peers()
+            
+            if not self.other_clients_ports:
+                print("  ✓ Sem outros clientes ativos - acesso imediato")
+                with self.cs_lock:
+                    self.requesting_cs = False
+                    self.in_cs = True
+                return True
 
-        for other_port in self.other_clients_ports:
-            self.send_request_to_client(other_port, current_ts)
+            for other_port in self.other_clients_ports:
+                self.send_request_to_client(other_port, current_ts)
+            
+            if self.wait_for_replies():
+                with self.cs_lock:
+                    self.requesting_cs = False
+                    self.in_cs = True
+                print(f"  ✓ Acesso concedido (TS: {current_ts})")
+                return True
+            
+            retries += 1
+            if retries < self.max_retries:
+                delay = self.retry_delay * (1 + random.random())  # Adiciona jitter
+                print(f"  ↻ Tentando novamente em {delay:.1f}s...")
+                time.sleep(delay)
         
-        self.wait_for_replies()
-        
+        print("  ⚠ Número máximo de tentativas excedido")
         with self.cs_lock:
             self.requesting_cs = False
-            self.in_cs = True
-        
-        print(f"Acesso concedido (TS: {current_ts})")
-    
+        return False
+
     def send_request_to_client(self, port, timestamp):
         try:
             channel = grpc.insecure_channel(f'localhost:{port}')
@@ -99,11 +145,12 @@ class SmartClient(printing_pb2_grpc.MutualExclusionServiceServicer):
             response = stub.RequestAccess(request, timeout=10)
             
             with self.reply_lock:
-                self.replies_received += 1
+                if response.access_granted:  # Só conta como resposta se access_granted=True
+                    self.replies_received += 1
             self.update_clock(response.lamport_timestamp)
             
-            status = "OK" if response.access_granted else "adiado"
-            print(f"Resposta da porta {port}: {status}")
+            status = "✓ OK" if response.access_granted else "⏳ Adiado"
+            print(f"  • Porta {port}: {status}")
             
             channel.close()
         except grpc.RpcError:
@@ -113,25 +160,38 @@ class SmartClient(printing_pb2_grpc.MutualExclusionServiceServicer):
     
     def wait_for_replies(self):
         required_replies = len(self.other_clients_ports)
-        print(f"Aguardando {required_replies} respostas (peers ativos: {self.other_clients_ports})...")
-
+        print(f"\n  Aguardando {required_replies} respostas...")
+        print(f"  Peers ativos: {self.other_clients_ports}")
+        
+        timeout = time.time() + 30
         while True:
             with self.reply_lock:
                 if self.replies_received >= required_replies:
                     break
+            if time.time() > timeout:
+                print("  ⚠ Timeout esperando respostas!")
+                # Não deveria prosseguir em caso de timeout
+                with self.cs_lock:
+                    self.requesting_cs = False
+                return False  # Retorna False indicando falha
             time.sleep(0.1)
 
-        print(f"Respostas recebidas: {required_replies}/{required_replies}")
-    
+        return True  # Retorna True indicando sucesso
+
     def release_critical_section(self):
         current_ts = self.increment_clock()
+        
+        print(f"\n{self.print_separator}")
+        print(f"← LIBERANDO SEÇÃO CRÍTICA")
+        print(f"  • Timestamp: {current_ts}")
+        if self.deferred_replies:
+            print(f"  • Respostas adiadas para: {self.deferred_replies}")
         
         with self.cs_lock:
             self.in_cs = False
             deferred = self.deferred_replies.copy()
             self.deferred_replies.clear()
         
-        print(f"\nLiberando secao critica (TS: {current_ts})")
         self.refresh_active_peers()
         for other_port in self.other_clients_ports:
             self.send_release_to_client(other_port, current_ts)
@@ -204,11 +264,15 @@ class SmartClient(printing_pb2_grpc.MutualExclusionServiceServicer):
                 request_number=self.request_number
             )
             
-            print(f"\nEnviando para impressao: {message}")
+            print(f"\n{self.print_separator}")
+            print(f"📨 ENVIANDO PARA IMPRESSÃO")
+            print(f"  • Mensagem: {message}")
+            print(f"  • Timestamp: {current_ts}")
             response = stub.SendToPrinter(request, timeout=10)
             
             self.update_clock(response.lamport_timestamp)
-            print(f"Confirmacao: {response.confirmation_message}")
+            print(f"  ✓ {response.confirmation_message}")
+            print(f"{self.print_separator}")
             
             channel.close()
             return True
@@ -218,7 +282,9 @@ class SmartClient(printing_pb2_grpc.MutualExclusionServiceServicer):
     
     def ReleaseAccess(self, request, context):
         current_clock = self.update_clock(request.lamport_timestamp)
-        print(f"[RELEASE] Cliente {request.client_id} (TS: {request.lamport_timestamp})")
+        print(f"\n{self.print_separator}")
+        print(f"↑ RELEASE RECEBIDO [TS: {request.lamport_timestamp}]")
+        print(f"  • De: Cliente {request.client_id}")
         return printing_pb2.EmptyResponse()
 
     def start_server(self):
@@ -246,9 +312,11 @@ class SmartClient(printing_pb2_grpc.MutualExclusionServiceServicer):
                 message_count += 1
                 message = f"Documento #{message_count} do Cliente {self.client_id}"
                 
-                self.request_critical_section()
-                self.send_to_printer(message)
-                self.release_critical_section()
+                if self.request_critical_section():
+                    self.send_to_printer(message)
+                    self.release_critical_section()
+                else:
+                    print("  ⚠ Tentando novamente em alguns segundos...")
                 
             except KeyboardInterrupt:
                 print(f"\nCliente {self.client_id} encerrado.")
