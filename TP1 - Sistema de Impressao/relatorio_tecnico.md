@@ -1,8 +1,17 @@
 # Relatório Técnico - Sistema de Impressão Distribuído
 
-**Disciplina:** Sistemas Distribuídos  
-**Trabalho:** Exclusão Mútua com Ricart-Agrawala  
-**Data:** 29 de Outubro 2025
+**Disciplina:** Computação Distribuída
+
+**Trabalho:** Sistema de Impressão Distribuída com Exclusão Mútua usando gRPC, Algoritmo de Ricart-Agrawala e Relógios Lógicos de Lamport
+
+### 1. Alunos
+-Ana Fernanda Souza Cancado
+
+-Arthur de Sá Braz de Matos
+
+-Guilherme Otávio de Oliveira
+
+-Pedro Augusto de Paula Ferreira dos Santos Souza
 
 ---
 
@@ -298,18 +307,4 @@ python smart_client.py 3 50054 50052 50053
 
 # Modo Debug
 python smart_client.py 1 50052 50053 --debug
-```
-
-## Apêndice B: Estrutura de Arquivos
-
-```
-projeto/
-├── printing.proto          # Definição dos serviços gRPC
-├── printing_pb2.py         # Gerado automaticamente
-├── printing_pb2_grpc.py    # Gerado automaticamente
-├── print_server.py         # Servidor de impressão
-├── smart_client.py         # Cliente inteligente
-├── requirements.txt        # Dependências Python
-├── README.md              # Documentação do usuário
-└── RELATORIO_TECNICO.md   # Este documento
 ```

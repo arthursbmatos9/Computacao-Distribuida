@@ -8,6 +8,14 @@ import printing_pb2
 import printing_pb2_grpc
 
 class SmartClient(printing_pb2_grpc.MutualExclusionServiceServicer):
+    """Cliente que participa do algoritmo distribuído de exclusão mútua.
+
+    Implementa uma versão do algoritmo Ricart-Agrawala usando relógios de Lamport
+    para ordenar requisições. Cada cliente expõe dois RPCs (RequestAccess e
+    ReleaseAccess) para negociar acesso à seção crítica. Quando um pedido é
+    adiado, guardamos o ID e, ao liberar a seção crítica, notificamos os
+    clientes adiados (neste código usamos ReleaseAccess como notificação).
+    """
     def __init__(self, client_id, port, other_clients_ports):
         self.client_id = client_id
         self.port = port
@@ -34,17 +42,37 @@ class SmartClient(printing_pb2_grpc.MutualExclusionServiceServicer):
         self.retry_delay = 2
 
     def increment_clock(self):
+        # Incrementa o relógio de Lamport de forma atômica e retorna o novo valor.
+        # Deve ser chamado sempre que este processo gera um evento local (ex.:
+        # antes de enviar uma requisição) para garantir ordenação correta.
         with self.clock_lock:
             self.lamport_clock += 1
             return self.lamport_clock
     
     def update_clock(self, received_timestamp):
+        # Atualiza o relógio local usando o timestamp recebido (regra de Lamport):
+        # L = max(L, received) + 1
+        # Deve ser chamado ao receber mensagens para manter a ordenação global.
         with self.clock_lock:
             self.lamport_clock = max(self.lamport_clock, received_timestamp) + 1
             return self.lamport_clock
     
     def RequestAccess(self, request, context):
-        """Recebe requisição de acesso de outro cliente"""
+        """Recebe requisição de acesso (RPC) de outro cliente.
+
+            Lógica:
+            - Atualiza o relógio com o timestamp recebido.
+            - Se este cliente não está interessado na SC, concede o acesso.
+            - Se estiver interessado/ocupado, compara prioridades (timestamp, client_id).
+                O par (timestamp, client_id) determina a prioridade: menor par => maior
+                prioridade para entrar primeiro.
+            - Se nossa prioridade for maior, adiamos a resposta (guardamos o ID).
+                Caso contrário, concedemos imediatamente.
+
+            Observação: a implementação atual armazena apenas os IDs nas respostas
+            adiadas e envia uma notificação via ReleaseAccess quando libera a SC.
+            Uma implementação mais robusta seria ter um RPC específico de GRANT.
+        """
         current_clock = self.update_clock(request.lamport_timestamp)
         
         print(f"\n{self.print_separator}")
@@ -68,6 +96,7 @@ class SmartClient(printing_pb2_grpc.MutualExclusionServiceServicer):
             
             if our_priority < their_priority:
                 # Nossa prioridade é maior - adia a resposta
+                # Guardamos o ID do cliente para enviar GRANTs quando liberarmos
                 self.deferred_replies.append(request.client_id)
                 print(f"  ⏳ Adiando resposta - nossa prioridade é maior")
                 print(f"     Nossa: (TS:{self.request_timestamp}, ID:{self.client_id})")
@@ -90,7 +119,15 @@ class SmartClient(printing_pb2_grpc.MutualExclusionServiceServicer):
                 )
     
     def request_critical_section(self):
-        """Solicita entrada na seção crítica usando Ricart-Agrawala"""
+        """Solicita entrada na seção crítica usando Ricart-Agrawala.
+
+        Passos principais:
+        1. Incrementa o relógio e marca que está requisitando a CS.
+        2. Envia Request (RPC) para todos peers ativos.
+        3. Aguarda GRANTs (aqui modelados como AccessResponse.access_granted=True
+           ou notificações via ReleaseAccess que incrementam replies_received).
+        4. Ao receber todos os GRANTs, entra na CS; caso contrário, desiste.
+        """
         self.request_number += 1
         current_ts = self.increment_clock()
         
@@ -134,7 +171,13 @@ class SmartClient(printing_pb2_grpc.MutualExclusionServiceServicer):
         return False
 
     def send_request_to_client(self, port, timestamp):
-        """Envia requisição de acesso para um cliente específico"""
+        """Envia requisição de acesso para um cliente específico.
+
+        Nota sobre timeouts: se o peer estiver inativo ou o stub levantar um
+        RpcError, contamos isso como um GRANT (assumimos que esse peer não está
+        participando). Se o peer responder com access_granted=False, isso indica
+        que o peer adiou a resposta e esperará até liberar a CS para notificar.
+        """
         try:
             channel = grpc.insecure_channel(f'localhost:{port}')
             stub = printing_pb2_grpc.MutualExclusionServiceStub(channel)
@@ -146,14 +189,16 @@ class SmartClient(printing_pb2_grpc.MutualExclusionServiceServicer):
             )
             
             response = stub.RequestAccess(request, timeout=10)
+            # Atualiza relógio local com timestamp da resposta
             self.update_clock(response.lamport_timestamp)
-            
+
             # Só conta como resposta se foi concedido acesso
             if response.access_granted:
                 with self.reply_lock:
                     self.replies_received += 1
                 print(f"  • Porta {port}: ✓ GRANT recebido")
             else:
+                # access_granted=False => peer adiou; ele irá notificar (via ReleaseAccess)
                 print(f"  • Porta {port}: ⏳ Resposta adiada (aguardando liberação)")
             
             channel.close()
@@ -168,34 +213,44 @@ class SmartClient(printing_pb2_grpc.MutualExclusionServiceServicer):
         print(f"\n  Aguardando {required_replies} GRANTs...")
         print(f"  Peers ativos: {self.other_clients_ports}")
         
+        # Timeout razoável para esperar GRANTs (pode ser ajustado conforme necessidade)
         timeout = time.time() + 60  # Aumentado para 60 segundos
         while True:
             with self.reply_lock:
                 current = self.replies_received
-            
+
             if current >= required_replies:
                 print(f"  ✓ Todos os {required_replies} GRANTs recebidos!")
                 return True
-            
+
             if time.time() > timeout:
                 print(f"  ⚠ Timeout! Recebidos {current}/{required_replies} GRANTs")
                 return False
-            
+
             time.sleep(0.1)
 
     def release_critical_section(self):
-        """Libera a seção crítica e envia GRANTs para requisições adiadas"""
+        """Libera a seção crítica e envia GRANTs para requisições adiadas.
+
+        Ao liberar, atualizamos o relógio, marcamos in_cs=False e notificamos
+        todos os clientes cujas requisições foram adiadas. A notificação é feita
+        hoje via RPC ReleaseAccess (um pouco impropriamente, já que o .proto não
+        possui um método Grant explícito), que por sua vez incrementa
+        replies_received no cliente solicitante.
+        """
         current_ts = self.increment_clock()
         
         print(f"\n{self.print_separator}")
         print(f"← LIBERANDO SEÇÃO CRÍTICA")
         print(f"  • Timestamp: {current_ts}")
         
+        # Marca que não está mais na seção crítica e captura a lista de adiados
         with self.cs_lock:
             self.in_cs = False
             deferred = self.deferred_replies.copy()
             self.deferred_replies.clear()
         
+        # Envia notificação (GRANT) para cada cliente cujo pedido foi adiado
         if deferred:
             print(f"  • Enviando GRANTs adiados para clientes: {deferred}")
             for client_id in deferred:
